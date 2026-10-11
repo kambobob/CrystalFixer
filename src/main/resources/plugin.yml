@@ -1,0 +1,17 @@
+name: CrystalPvP
+version: 1.0.0
+main: com.example.crystalpvp.CrystalPvPPlugin
+api-version: '26.2'
+folia-supported: true
+description: Removes crystal/anchor fire and buffs crystal and anchor damage.
+author: YourName
+
+commands:
+  crystalpvp:
+    description: CrystalPvP admin command
+    usage: /crystalpvp reload
+
+permissions:
+  crystalpvp.reload:
+    description: Allows reloading the config
+    default: op
