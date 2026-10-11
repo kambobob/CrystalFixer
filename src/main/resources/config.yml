@@ -1,0 +1,26 @@
+# CrystalPvP configuration
+# Run /crystalpvp reload after editing (no restart needed).
+
+no-fire:
+  enabled: true
+
+  # In the End, vanilla crystals keep placing a fire block at their position.
+  # When true, that fire is removed from crystals players place.
+  remove-crystal-fire: true
+
+  # Removes the fire respawn anchor explosions leave behind.
+  remove-anchor-fire: true
+
+  # Also cancel fire created by other explosions (ghast fireballs, etc.)
+  cancel-explosion-fire: true
+
+damage:
+  enabled: true
+
+  # Final damage = vanilla damage * multiplier
+  #   1.0 = vanilla, 1.5 = +50%, 2.0 = double
+  crystal-multiplier: 1.5
+  anchor-multiplier: 1.5
+
+  # true = only buff damage dealt to players (mobs take vanilla damage)
+  players-only: false
