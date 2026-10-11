@@ -1,26 +1,42 @@
 # CrystalPvP configuration
 # Run /crystalpvp reload after editing (no restart needed).
+# Every option here is independent. For "allow-..." options:
+#   false = NOT allowed (fire is removed)     true = vanilla behavior
 
-no-fire:
-  enabled: true
+fire:
+  # Fire that vanilla End crystals place at their position (End dimension only).
+  allow-crystal-fire: false
 
-  # In the End, vanilla crystals keep placing a fire block at their position.
-  # When true, that fire is removed from crystals players place.
-  remove-crystal-fire: true
+  # Fire left behind by respawn anchor (and bed) explosions.
+  allow-anchor-fire: false
 
-  # Removes the fire respawn anchor explosions leave behind.
-  remove-anchor-fire: true
-
-  # Also cancel fire created by other explosions (ghast fireballs, etc.)
-  cancel-explosion-fire: true
+  # Fire from other explosions (ghast fireballs, etc.)
+  allow-other-explosion-fire: true
 
 damage:
   enabled: true
-
-  # Final damage = vanilla damage * multiplier
-  #   1.0 = vanilla, 1.5 = +50%, 2.0 = double
+  # Final damage = vanilla damage * multiplier. 1.0 = vanilla, 1.5 = +50%
   crystal-multiplier: 1.5
   anchor-multiplier: 1.5
-
-  # true = only buff damage dealt to players (mobs take vanilla damage)
+  # true = only buff damage dealt to players
   players-only: false
+
+explosions:
+  # false = explosions still hurt but don't destroy blocks (less lag, intact arenas)
+  crystal-break-blocks: true
+  anchor-break-blocks: true
+
+optimizer:
+  # Needs the PacketEvents plugin. When you hit a crystal, your client removes
+  # it immediately instead of waiting for the next server tick.
+  enabled: true
+
+  # Only fast-remove if you are within this many blocks of the crystal's hitbox.
+  max-reach: 3.4
+
+  # If the server hasn't removed the crystal this many ticks after your hit
+  # (hit rejected), it is re-sent to you so it never stays invisible.
+  resync-ticks: 4
+
+  # Log optimizer decisions to console (turn on if it seems to do nothing)
+  debug: false
