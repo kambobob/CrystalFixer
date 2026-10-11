@@ -9,9 +9,11 @@ import org.bukkit.block.Block;
 import org.bukkit.command.Command;
 import org.bukkit.command.CommandSender;
 import org.bukkit.configuration.file.FileConfiguration;
+import org.bukkit.configuration.file.YamlConfiguration;
 import org.bukkit.damage.DamageSource;
 import org.bukkit.damage.DamageType;
 import org.bukkit.entity.EnderCrystal;
+import org.bukkit.entity.Entity;
 import org.bukkit.entity.LivingEntity;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
@@ -20,138 +22,260 @@ import org.bukkit.event.Listener;
 import org.bukkit.event.block.BlockExplodeEvent;
 import org.bukkit.event.block.BlockIgniteEvent;
 import org.bukkit.event.entity.EntityDamageEvent;
+import org.bukkit.event.entity.EntityExplodeEvent;
 import org.bukkit.event.entity.EntityPlaceEvent;
 import org.bukkit.event.entity.ExplosionPrimeEvent;
 import org.bukkit.plugin.java.JavaPlugin;
 
+import java.io.File;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 public final class CrystalPvPPlugin extends JavaPlugin implements Listener {
 
-    private record Settings(
-            boolean noFire,
-            boolean removeCrystalFire,
-            boolean removeAnchorFire,
-            boolean cancelExplosionFire,
+    record Settings(
+            boolean allowCrystalFire,
+            boolean allowAnchorFire,
+            boolean allowOtherExplosionFire,
             boolean damageEnabled,
             double crystalMultiplier,
             double anchorMultiplier,
-            boolean playersOnly
+            boolean playersOnly,
+            boolean crystalBreakBlocks,
+            boolean anchorBreakBlocks,
+            boolean optimizerEnabled,
+            double maxReach,
+            int resyncTicks,
+            boolean debug
     ) {}
 
     // volatile: events run on many region threads under Folia
     private volatile Settings settings;
+    private CrystalOptimizer optimizer;
+
+    Settings settings() {
+        return settings;
+    }
 
     @Override
     public void onEnable() {
-        saveDefaultConfig();
         loadSettings();
         getServer().getPluginManager().registerEvents(this, this);
-        getLogger().info("CrystalPvP enabled.");
+        setupOptimizer();
+        for (String line : describe(settings)) {
+            getLogger().info(line);
+        }
+    }
+
+    @Override
+    public void onDisable() {
+        if (optimizer != null) {
+            try {
+                optimizer.unregister();
+            } catch (Throwable ignored) {
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Config
+    // ---------------------------------------------------------------
+
+    /** If the config is in the old format, back it up and write a fresh one. */
+    private void ensureCurrentConfig() {
+        File file = new File(getDataFolder(), "config.yml");
+        if (file.exists()) {
+            FileConfiguration existing = YamlConfiguration.loadConfiguration(file);
+            if (!existing.contains("fire.allow-crystal-fire")) {
+                File backup = new File(getDataFolder(), "config-old.yml");
+                if (backup.exists()) {
+                    backup.delete();
+                }
+                if (file.renameTo(backup)) {
+                    getLogger().warning("Old-format config.yml found. Saved it as config-old.yml "
+                            + "and created a new config.yml with the new options.");
+                }
+            }
+        }
+        saveDefaultConfig();
     }
 
     private void loadSettings() {
+        ensureCurrentConfig();
         reloadConfig();
         FileConfiguration c = getConfig();
 
-        double crystal = Math.max(0.0, c.getDouble("damage.crystal-multiplier", 1.5));
-        double anchor = Math.max(0.0, c.getDouble("damage.anchor-multiplier", 1.5));
-
         settings = new Settings(
-                c.getBoolean("no-fire.enabled", true),
-                c.getBoolean("no-fire.remove-crystal-fire", true),
-                c.getBoolean("no-fire.remove-anchor-fire", true),
-                c.getBoolean("no-fire.cancel-explosion-fire", true),
+                c.getBoolean("fire.allow-crystal-fire", false),
+                c.getBoolean("fire.allow-anchor-fire", false),
+                c.getBoolean("fire.allow-other-explosion-fire", true),
                 c.getBoolean("damage.enabled", true),
-                crystal,
-                anchor,
-                c.getBoolean("damage.players-only", false)
+                Math.max(0.0, c.getDouble("damage.crystal-multiplier", 1.5)),
+                Math.max(0.0, c.getDouble("damage.anchor-multiplier", 1.5)),
+                c.getBoolean("damage.players-only", false),
+                c.getBoolean("explosions.crystal-break-blocks", true),
+                c.getBoolean("explosions.anchor-break-blocks", true),
+                c.getBoolean("optimizer.enabled", true),
+                Math.max(1.0, Math.min(4.0, c.getDouble("optimizer.max-reach", 3.4))),
+                Math.max(2, Math.min(40, c.getInt("optimizer.resync-ticks", 4))),
+                c.getBoolean("optimizer.debug", false)
         );
+    }
+
+    private List<String> describe(Settings s) {
+        List<String> out = new ArrayList<>();
+        out.add("Crystal fire (End): " + (s.allowCrystalFire() ? "ALLOWED (vanilla)" : "REMOVED"));
+        out.add("Anchor fire: " + (s.allowAnchorFire() ? "ALLOWED (vanilla)" : "REMOVED"));
+        out.add("Other explosion fire: " + (s.allowOtherExplosionFire() ? "ALLOWED (vanilla)" : "REMOVED"));
+        out.add("Damage buff: " + (s.damageEnabled()
+                ? "crystal x" + s.crystalMultiplier() + ", anchor x" + s.anchorMultiplier()
+                + (s.playersOnly() ? " (players only)" : "")
+                : "OFF"));
+        out.add("Block damage: crystals " + (s.crystalBreakBlocks() ? "break" : "don't break")
+                + " blocks, anchors " + (s.anchorBreakBlocks() ? "break" : "don't break") + " blocks");
+        out.add("Optimizer: " + (optimizer == null
+                ? "OFF (PacketEvents plugin not found)"
+                : (s.optimizerEnabled() ? "ON, reach " + s.maxReach() : "disabled in config")));
+        return out;
+    }
+
+    private void setupOptimizer() {
+        if (getServer().getPluginManager().getPlugin("packetevents") == null) {
+            if (settings.optimizerEnabled()) {
+                getLogger().warning("Crystal optimizer is enabled in config but the PacketEvents "
+                        + "plugin is not installed. Install PacketEvents 2.13.0 to use it.");
+            }
+            return;
+        }
+        try {
+            optimizer = new CrystalOptimizer(this);
+            optimizer.register();
+        } catch (Throwable t) {
+            optimizer = null;
+            getLogger().warning("Could not start the crystal optimizer: " + t);
+        }
     }
 
     @Override
     public boolean onCommand(CommandSender sender, Command command, String label, String[] args) {
-        if (args.length == 1 && args[0].equalsIgnoreCase("reload")) {
-            if (!sender.hasPermission("crystalpvp.reload")) {
-                sender.sendMessage(Component.text("You don't have permission."));
-                return true;
-            }
-            loadSettings();
-            sender.sendMessage(Component.text("CrystalPvP config reloaded."));
+        if (args.length == 0) {
+            return false;
+        }
+        if (!sender.hasPermission("crystalpvp.reload")) {
+            sender.sendMessage(Component.text("You don't have permission."));
             return true;
         }
-        return false;
+        if (args[0].equalsIgnoreCase("reload")) {
+            loadSettings();
+            sender.sendMessage(Component.text("CrystalPvP config reloaded. Active settings:"));
+        } else if (!args[0].equalsIgnoreCase("status")) {
+            return false;
+        }
+        for (String line : describe(settings)) {
+            sender.sendMessage(Component.text(" - " + line));
+        }
+        return true;
     }
 
     // ---------------------------------------------------------------
-    // No fire
+    // Fire
     // ---------------------------------------------------------------
 
-    /** Crystal explosions never create fire. */
+    /** Crystal explosions never ignite when crystal fire is not allowed. */
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onExplosionPrime(ExplosionPrimeEvent event) {
-        Settings s = settings;
-        if (s.noFire() && event.getEntity() instanceof EnderCrystal) {
+        if (event.getEntity() instanceof EnderCrystal && !settings.allowCrystalFire()) {
             event.setFire(false);
         }
     }
 
-    /** Cancels fire created by explosions, where the server reports it as an ignite event. */
+    /** Stops explosion fire at the source. */
     @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
     public void onIgnite(BlockIgniteEvent event) {
+        if (event.getCause() != BlockIgniteEvent.IgniteCause.EXPLOSION) {
+            return;
+        }
         Settings s = settings;
-        if (s.noFire() && s.cancelExplosionFire()
-                && event.getCause() == BlockIgniteEvent.IgniteCause.EXPLOSION) {
+        Entity igniter = event.getIgnitingEntity();
+        boolean cancel;
+        if (igniter == null) {
+            cancel = !s.allowAnchorFire(); // block explosions: respawn anchors / beds
+        } else if (igniter instanceof EnderCrystal) {
+            cancel = !s.allowCrystalFire();
+        } else {
+            cancel = !s.allowOtherExplosionFire();
+        }
+        if (cancel) {
             event.setCancelled(true);
         }
     }
 
+    /** Anchors: optionally don't break blocks. */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onBlockExplodeBlocks(BlockExplodeEvent event) {
+        if (!settings.anchorBreakBlocks()) {
+            event.blockList().clear();
+        }
+    }
+
     /**
-     * Respawn anchor explosions place fire only on blocks they just destroyed.
-     * Record those positions and clear any fire there one tick later.
+     * Backup for anchor fire: even if something places fire anyway, sweep every
+     * position the explosion touched one tick later and remove fire there.
      */
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
-    public void onBlockExplode(BlockExplodeEvent event) {
-        Settings s = settings;
-        if (!s.noFire() || !s.removeAnchorFire()) {
-            return;
-        }
-        if (event.getExplodedBlockState().getType() != Material.RESPAWN_ANCHOR) {
+    public void onBlockExplodeCleanup(BlockExplodeEvent event) {
+        if (settings.allowAnchorFire()) {
             return;
         }
 
         Block origin = event.getBlock();
         World world = origin.getWorld();
 
-        List<int[]> positions = new ArrayList<>(event.blockList().size() + 1);
-        positions.add(new int[]{origin.getX(), origin.getY(), origin.getZ()});
+        Map<Long, List<int[]>> byChunk = new HashMap<>();
+        addPosition(byChunk, origin.getX(), origin.getY(), origin.getZ());
         for (Block b : event.blockList()) {
-            positions.add(new int[]{b.getX(), b.getY(), b.getZ()});
+            addPosition(byChunk, b.getX(), b.getY(), b.getZ());
         }
 
-        Bukkit.getRegionScheduler().runDelayed(this, origin.getLocation(), task -> {
-            for (int[] p : positions) {
-                if (!Bukkit.isOwnedByCurrentRegion(world, p[0] >> 4, p[2] >> 4)) {
-                    continue;
+        for (Map.Entry<Long, List<int[]>> entry : byChunk.entrySet()) {
+            int chunkX = (int) (entry.getKey() >> 32);
+            int chunkZ = entry.getKey().intValue();
+            List<int[]> positions = entry.getValue();
+
+            Bukkit.getRegionScheduler().runDelayed(this, world, chunkX, chunkZ, task -> {
+                for (int[] p : positions) {
+                    Block b = world.getBlockAt(p[0], p[1], p[2]);
+                    if (Tag.FIRE.isTagged(b.getType())) {
+                        b.setType(Material.AIR, false);
+                    }
                 }
-                Block b = world.getBlockAt(p[0], p[1], p[2]);
-                if (Tag.FIRE.isTagged(b.getType())) {
-                    b.setType(Material.AIR, false);
-                }
-            }
-        }, 1L);
+            }, 1L);
+        }
+    }
+
+    private static void addPosition(Map<Long, List<int[]>> map, int x, int y, int z) {
+        long key = ((long) (x >> 4) << 32) | ((z >> 4) & 0xFFFFFFFFL);
+        map.computeIfAbsent(key, k -> new ArrayList<>()).add(new int[]{x, y, z});
+    }
+
+    /** Crystals: optionally don't break blocks. */
+    @EventHandler(priority = EventPriority.HIGH, ignoreCancelled = true)
+    public void onEntityExplode(EntityExplodeEvent event) {
+        if (event.getEntity() instanceof EnderCrystal && !settings.crystalBreakBlocks()) {
+            event.blockList().clear();
+        }
     }
 
     /**
      * In the End, vanilla crystals place a fire block at their own position
-     * every tick. There is no event for that, so we watch crystals that
-     * players place and clear the fire.
+     * every tick. There is no event for that, so watch crystals that players
+     * place and clear the fire.
      */
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onCrystalPlace(EntityPlaceEvent event) {
-        Settings s = settings;
-        if (!s.noFire() || !s.removeCrystalFire()) {
+        if (settings.allowCrystalFire()) {
             return;
         }
         if (!(event.getEntity() instanceof EnderCrystal crystal)) {
@@ -171,8 +295,7 @@ public final class CrystalPvPPlugin extends JavaPlugin implements Listener {
                 task.cancel();
                 return;
             }
-            Settings s = settings;
-            if (!s.noFire() || !s.removeCrystalFire()) {
+            if (settings.allowCrystalFire()) {
                 return;
             }
             Block block = crystal.getLocation().getBlock();
